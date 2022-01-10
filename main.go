@@ -82,7 +82,7 @@ func readFile(
 	nSuccess := 0
 	nErrors := 0
 	scanner := bufio.NewScanner(zr)
-	for scanner.Scan() && nSuccess < 5 {
+	for scanner.Scan() {
 		text := scanner.Text()
 		apps, err := parseLine(text, filename)
 		if err != nil {
@@ -93,6 +93,10 @@ func readFile(
 			nSuccess += 1
 			channels[apps.DevType] <- &apps
 		}
+	}
+	err = scanner.Err()
+	if err != nil {
+		logger.Println("Scanner Error")
 	}
 	errByFiles := <-errChannel
 	nSendingErrors := errByFiles[filename]
@@ -130,32 +134,27 @@ func writeInMemcached(
 	timeRetry int,
 	logger *log.Logger,
 ) {
-	for {
-		val, ok := <-channel
-		if ok == false {
-			break
-		} else {
-			key := fmt.Sprintf("%s:%s", val.DevType, val.DevId)
-			strVal := appsinstalled.UserApps{
-				Apps: val.Apps, Lat: &val.Lat, Lon: &val.Lon,
-			}
-			var err error
-			for i := 0; i < maxRetry; i++ {
-				err = memClient.Set(&memcache.Item{Key: key, Value: []byte(strVal.String())})
-				if err == nil {
-					break
-				}
-				time.Sleep(time.Duration(timeRetry) * time.Second)
-			}
-
-			if err != nil {
-				logger.Printf("sending failed: %s", err)
-				errorByFiles := <-errChannel
-				errorByFiles[val.FileName] += 1
-				errChannel <- errorByFiles
-			}
-			logger.Printf("set %s in %s \n", strVal.String(), val.DevId)
+	for val := range channel {
+		key := fmt.Sprintf("%s:%s", val.DevType, val.DevId)
+		strVal := appsinstalled.UserApps{
+			Apps: val.Apps, Lat: &val.Lat, Lon: &val.Lon,
 		}
+		var err error
+		for i := 0; i < maxRetry; i++ {
+			err = memClient.Set(&memcache.Item{Key: key, Value: []byte(strVal.String())})
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Duration(timeRetry) * time.Second)
+		}
+
+		if err != nil {
+			logger.Printf("sending failed: %s", err)
+			errorByFiles := <-errChannel
+			errorByFiles[val.FileName] += 1
+			errChannel <- errorByFiles
+		}
+		logger.Printf("set %s in %s \n", strVal.String(), val.DevId)
 	}
 }
 
@@ -169,6 +168,7 @@ func main() {
 	adid := flag.String("adid", "127.0.0.1:33015", "memchache addr to adid")
 	dvid := flag.String("dvid", "127.0.0.1:33016", "memchache addr to dvid")
 	logName := flag.String("log", "", "name to log file")
+	memTimeout := flag.Int("timeout", 1, "memclient timeout")
 
 	flag.Parse()
 
@@ -194,12 +194,14 @@ func main() {
 	}
 	// канал для ошибок
 	errChannel := make(chan map[string]int)
+	errChannel <- map[string]int{}
 
 	// заведем 4 канала
 	channels := map[string]chan *appsInstalled{}
 	for device, addr := range deviceMemc {
 		channels[device] = make(chan *appsInstalled, *channelSize)
 		mc := memcache.New(addr)
+		mc.Timeout = time.Duration(*memTimeout) * time.Second
 		go writeInMemcached(mc, channels[device], errChannel, *maxRetry, *timeRetry, &logger)
 	}
 
@@ -215,7 +217,4 @@ func main() {
 	}
 
 	wg.Wait()
-	for _, c := range channels {
-		close(c)
-	}
 }
