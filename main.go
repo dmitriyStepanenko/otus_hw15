@@ -26,6 +26,11 @@ type appsInstalled struct {
 	FileName string
 }
 
+type fileStats struct {
+	sync.Mutex
+	stats map[string]int
+}
+
 var NormalErrRate = 0.01
 var ErrParseLine = errors.New("can not parse line")
 
@@ -62,7 +67,7 @@ func readFile(
 	filename string,
 	channels map[string]chan *appsInstalled,
 	wg *sync.WaitGroup,
-	errChannel chan map[string]int,
+	stats *fileStats,
 	logger *log.Logger,
 ) {
 
@@ -98,10 +103,10 @@ func readFile(
 	if err != nil {
 		logger.Println("Scanner Error")
 	}
-	errByFiles := <-errChannel
-	nSendingErrors := errByFiles[filename]
-	delete(errByFiles, filename)
-	errChannel <- errByFiles
+	stats.Lock()
+	nSendingErrors := stats.stats[filename]
+	delete(stats.stats, filename)
+	stats.Unlock()
 
 	nErrors += nSendingErrors
 	nSuccess -= nSendingErrors
@@ -129,7 +134,7 @@ func readFile(
 func writeInMemcached(
 	memClient *memcache.Client,
 	channel chan *appsInstalled,
-	errChannel chan map[string]int,
+	stats *fileStats,
 	maxRetry int,
 	timeRetry int,
 	logger *log.Logger,
@@ -150,9 +155,9 @@ func writeInMemcached(
 
 		if err != nil {
 			logger.Printf("sending failed: %s", err)
-			errorByFiles := <-errChannel
-			errorByFiles[val.FileName] += 1
-			errChannel <- errorByFiles
+			stats.Lock()
+			stats.stats[val.FileName] += 1
+			stats.Unlock()
 		}
 		logger.Printf("set %s in %s \n", strVal.String(), val.DevId)
 	}
@@ -193,8 +198,7 @@ func main() {
 		"dvid": *dvid,
 	}
 	// канал для ошибок
-	errChannel := make(chan map[string]int)
-	errChannel <- map[string]int{}
+	stats := fileStats{}
 
 	// заведем 4 канала
 	channels := map[string]chan *appsInstalled{}
@@ -202,7 +206,7 @@ func main() {
 		channels[device] = make(chan *appsInstalled, *channelSize)
 		mc := memcache.New(addr)
 		mc.Timeout = time.Duration(*memTimeout) * time.Second
-		go writeInMemcached(mc, channels[device], errChannel, *maxRetry, *timeRetry, &logger)
+		go writeInMemcached(mc, channels[device], &stats, *maxRetry, *timeRetry, &logger)
 	}
 
 	fileNames, err := filepath.Glob(*pattern)
@@ -213,7 +217,7 @@ func main() {
 	for _, fn := range fileNames {
 		logger.Println("start read file")
 		wg.Add(1)
-		go readFile(fn, channels, &wg, errChannel, &logger)
+		go readFile(fn, channels, &wg, &stats, &logger)
 	}
 
 	wg.Wait()
